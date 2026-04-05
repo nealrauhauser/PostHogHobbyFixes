@@ -6,6 +6,14 @@ PostHog's self-hosted hobby deployment (`docker-compose.hobby.yml` + `docker-com
 
 The root cause is a pattern: **the hobby compose files and Docker images assume PostHog Cloud infrastructure** (managed Redis with TLS, specific schema state, correct env propagation) but ship without the configuration or migrations needed to work in a standalone Docker Compose environment.
 
+## Workarounds Available
+
+We've built an automated `setup.sh` and documented all 12 issues with fixes in a public repo:
+
+**https://github.com/nealrauhauser/PostHogHobbyFixes**
+
+The repo includes a one-command deploy script, a full issue registry, and a post-update checklist for surviving future `docker compose pull` breakage.
+
 ## Related Existing Issues
 
 - [PostHog #37202](https://github.com/PostHog/posthog/issues/37202) — Plugin server not reachable (hobby deploy)
