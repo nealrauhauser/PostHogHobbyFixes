@@ -1,4 +1,4 @@
-# PostHog Self-Hosted Hobby Deploy: Comprehensive Bug Report
+# Hobby Self-Host Dirty Dozen
 
 ## Summary
 
