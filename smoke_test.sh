@@ -17,6 +17,13 @@ PASS=0
 FAIL=0
 WARN=0
 
+# Failure category flags — drive the remediation section
+HAS_SCHEMA_DRIFT=false
+HAS_PORT_DRIFT=false
+HAS_CONTAINER_DOWN=false
+HAS_REDIS_ERRORS=false
+HAS_MISSING_CONFIG=false
+
 pass() { echo "  ✓ $1"; PASS=$((PASS + 1)); }
 fail() { echo "  ✗ $1"; FAIL=$((FAIL + 1)); }
 warn() { echo "  ~ $1"; WARN=$((WARN + 1)); }
@@ -46,9 +53,13 @@ UNHEALTHY=$(docker compose ps -a --format "{{.Name}} {{.Status}}" 2>/dev/null \
 if [ -z "$UNHEALTHY" ]; then
     pass "All containers healthy"
 else
-    echo "$UNHEALTHY" | while read -r line; do
-        fail "Container: $line"
-    done
+    HAS_CONTAINER_DOWN=true
+    UNHEALTHY_COUNT=0
+    while read -r line; do
+        echo "  ✗ Container: $line"
+        UNHEALTHY_COUNT=$((UNHEALTHY_COUNT + 1))
+    done <<< "$UNHEALTHY"
+    FAIL=$((FAIL + UNHEALTHY_COUNT))
 fi
 
 # Check specific critical services are Up (not just exist)
@@ -58,6 +69,7 @@ for svc in web worker plugins ingestion-general redis7 clickhouse kafka db proxy
         pass "$svc is running"
     else
         fail "$svc is NOT running (status: ${status:-not found})"
+        HAS_CONTAINER_DOWN=true
     fi
 done
 
@@ -88,6 +100,7 @@ for col in project_id secret_api_token person_processing_opt_out heatmaps_opt_in
         pass "posthog_team.$col exists"
     else
         fail "posthog_team.$col MISSING (Issue 11)"
+        HAS_SCHEMA_DRIFT=true
     fi
 done
 
@@ -96,6 +109,7 @@ if $DB_CMD -c "SELECT column_name FROM information_schema.columns WHERE table_na
     pass "posthog_organization.available_product_features exists"
 else
     fail "posthog_organization.available_product_features MISSING (Issue 11)"
+    HAS_SCHEMA_DRIFT=true
 fi
 
 # posthog_grouptypemapping.project_id
@@ -103,6 +117,7 @@ if $DB_CMD -c "SELECT column_name FROM information_schema.columns WHERE table_na
     pass "posthog_grouptypemapping.project_id exists"
 else
     fail "posthog_grouptypemapping.project_id MISSING (Issue 11)"
+    HAS_SCHEMA_DRIFT=true
 fi
 
 echo ""
@@ -223,8 +238,9 @@ echo ""
 
 # ═══════════════════════════════════════════════════════════════════════
 # SECTION 7: Plugin Server (Node)
-# Verify the plugin server's HTTP health endpoint returns ok on the
-# correct port (Issue 10: moved from 8001 to 6738, we override back).
+# Verify the plugin server's HTTP health endpoint returns ok.
+# Issue 10: upstream default moved from 8001 to 6738; we configure
+# whichever port matches the current image via HTTP_SERVER_PORT.
 # Also check that it's not crash-looping on Redis TLS (Issue 7) or
 # schema drift (Issue 11).
 # ═══════════════════════════════════════════════════════════════════════
@@ -232,9 +248,10 @@ echo ""
 echo "7. Plugin Server (Node)"
 echo "───────────────────────"
 
-# Try port 8001 first (our override), then 6738 (upstream default)
+# Try configured port first, then fallbacks
+CONFIGURED_PLUGIN_PORT=$(grep "^HTTP_SERVER_PORT=" dev-services.env 2>/dev/null | cut -d= -f2)
 PLUGIN_HEALTH=""
-for port in 8001 6738; do
+for port in ${CONFIGURED_PLUGIN_PORT:-6738} 6738 8001; do
     PLUGIN_HEALTH=$(docker compose exec -T web curl -s "http://plugins:${port}/_health" 2>/dev/null || true)
     if echo "$PLUGIN_HEALTH" | grep -q '"status":"ok"'; then
         pass "Plugin server /_health → ok (port $port)"
@@ -295,6 +312,7 @@ TLS_ERRORS=$(docker compose logs --tail=20 plugins ingestion-general ingestion-l
     | grep -c "ETIMEDOUT\|Enough of this" || true)
 if [ "$TLS_ERRORS" -gt 0 ]; then
     fail "Redis TLS/connection errors in recent logs ($TLS_ERRORS occurrences)"
+    HAS_REDIS_ERRORS=true
 else
     pass "No Redis connection errors in recent logs"
 fi
@@ -366,6 +384,7 @@ for var in CDP_REDIS_HOST LOGS_REDIS_HOST TRACES_REDIS_HOST SESSION_RECORDING_AP
         pass "$var set in dev-services.env"
     else
         fail "$var MISSING from dev-services.env"
+        HAS_MISSING_CONFIG=true
     fi
 done
 
@@ -375,6 +394,7 @@ for var in COMPOSE_FILE CADDY_HOST SKIP_SERVICE_VERSION_REQUIREMENTS; do
         pass "$var set in .env"
     else
         fail "$var MISSING from .env"
+        HAS_MISSING_CONFIG=true
     fi
 done
 
@@ -425,6 +445,7 @@ for var in $NEW_LOCALHOST; do
         pass "$var is overridden"
     else
         fail "$var defaults to 127.0.0.1 but is NOT in dev-services.env"
+        HAS_MISSING_CONFIG=true
     fi
 done
 
@@ -439,17 +460,21 @@ for var in $NEW_TLS; do
         pass "$var is overridden"
     else
         fail "$var defaults to TLS=true but is NOT in dev-services.env"
+        HAS_MISSING_CONFIG=true
     fi
 done
 
 # Health port check
 CURRENT_PORT=$(docker compose exec -T plugins sh -c "grep 'DEFAULT_HTTP_SERVER_PORT' /code/nodejs/dist/common/config.js 2>/dev/null" 2>/dev/null \
-    | grep -oP '\d+' || true)
+    | grep -oP '\d+' | tail -1 || true)
 CONFIGURED_PORT=$(grep "^HTTP_SERVER_PORT=" dev-services.env 2>/dev/null | cut -d= -f2)
 
 if [ -n "$CURRENT_PORT" ] && [ -n "$CONFIGURED_PORT" ]; then
     if [ "$CURRENT_PORT" != "$CONFIGURED_PORT" ]; then
         fail "Health port drift: image default=$CURRENT_PORT, configured=$CONFIGURED_PORT"
+        HAS_PORT_DRIFT=true
+        DRIFT_IMG_PORT="$CURRENT_PORT"
+        DRIFT_CFG_PORT="$CONFIGURED_PORT"
     else
         pass "Health port matches ($CONFIGURED_PORT)"
     fi
@@ -458,7 +483,7 @@ fi
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════
-# Summary
+# Summary + Remediation
 # ═══════════════════════════════════════════════════════════════════════
 
 echo "══════════════════════════════════════════"
@@ -467,7 +492,65 @@ echo "════════════════════════�
 
 if [ $FAIL -gt 0 ]; then
     echo ""
-    echo "See PostHogFuckups.md for fixes: https://github.com/nealrauhauser/PostHogHobbyFixes"
+    echo "┌─ Remediation ────────────────────────────┐"
+
+    if $HAS_SCHEMA_DRIFT; then
+        echo "│"
+        echo "│ SCHEMA DRIFT (Issue 11)"
+        echo "│ The Node plugin server expects columns that"
+        echo "│ Django hasn't created yet. Run migrations:"
+        echo "│"
+        echo "│   docker compose exec -T web python manage.py migrate"
+        echo "│"
+        echo "│ If columns are still missing after migrate,"
+        echo "│ the image is ahead of bundled migrations."
+        echo "│ See ISSUES.md Issue 11 for ALTER TABLE fixes."
+    fi
+
+    if $HAS_PORT_DRIFT; then
+        echo "│"
+        echo "│ HEALTH PORT DRIFT"
+        echo "│ The plugin image changed its default health port"
+        echo "│ from $DRIFT_CFG_PORT to $DRIFT_IMG_PORT. Update dev-services.env:"
+        echo "│"
+        echo "│   sed -i 's/^HTTP_SERVER_PORT=.*/HTTP_SERVER_PORT=${DRIFT_IMG_PORT}/' dev-services.env"
+        echo "│"
+        echo "│ Then: docker compose restart plugins ingestion-general"
+    fi
+
+    if $HAS_CONTAINER_DOWN; then
+        echo "│"
+        echo "│ CONTAINERS DOWN"
+        echo "│ Check logs for the failing service:"
+        echo "│"
+        echo "│   docker compose logs --tail=50 <service-name>"
+        echo "│   docker compose up -d <service-name>"
+    fi
+
+    if $HAS_REDIS_ERRORS; then
+        echo "│"
+        echo "│ REDIS TLS/CONNECTION ERRORS (Issue 7)"
+        echo "│ Node services are failing to connect to Redis."
+        echo "│ Ensure all *_REDIS_TLS=false vars are in dev-services.env"
+        echo "│ and all *_REDIS_HOST vars point to redis7 (not 127.0.0.1)."
+        echo "│"
+        echo "│   docker compose restart plugins ingestion-general ingestion-logs ingestion-traces"
+    fi
+
+    if $HAS_MISSING_CONFIG; then
+        echo "│"
+        echo "│ MISSING CONFIG VARS"
+        echo "│ Required env vars are not set. Compare against"
+        echo "│ the setup script to find what's missing:"
+        echo "│"
+        echo "│   diff <(grep -oP '^\w+(?==)' dev-services.env | sort) \\"
+        echo "│        <(grep -oP '^\w+(?==)' /home/repoman/HBbackend/PostHog/setup.sh | sort)"
+    fi
+
+    echo "│"
+    echo "│ Full reference: ISSUES.md"
+    echo "│ https://github.com/nealrauhauser/PostHogHobbyFixes"
+    echo "└─────────────────────────────────────────┘"
 fi
 
 exit $FAIL

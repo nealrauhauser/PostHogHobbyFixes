@@ -9,8 +9,13 @@
 # Auto-detects BIND_ADDR from hostname. Override with:
 #   BIND_ADDR=<ip> ./setup.sh
 #
+# Optional env vars:
+#   BIND_ADDR        — IP to bind ports to (default: 127.0.0.1)
+#   PLUGIN_HTTP_PORT — Plugin server health port (default: 6738, upstream default)
+#
 # Usage:
 #   ./setup.sh
+#   PLUGIN_HTTP_PORT=8001 ./setup.sh   # if 6738 conflicts with your stack
 #
 # Prerequisites:
 #   - Docker + Docker Compose
@@ -77,7 +82,7 @@ LOGS_REDIS_TLS=false
 TRACES_REDIS_HOST=redis7
 TRACES_REDIS_TLS=false
 SESSION_RECORDING_API_REDIS_HOST=redis7
-HTTP_SERVER_PORT=8001
+HTTP_SERVER_PORT=6738
 KAFKA_HOSTS=kafka:9092
 OBJECT_STORAGE_ENDPOINT=http://objectstorage:19000
 OBJECT_STORAGE_ACCESS_KEY_ID=object_storage_root_user
@@ -85,6 +90,12 @@ OBJECT_STORAGE_SECRET_ACCESS_KEY=object_storage_root_password
 IS_BEHIND_PROXY=true
 DISABLE_SECURE_SSL_REDIRECT=true
 DEVENV
+    # Allow overriding the plugin server health port (default 6738 matches
+    # current upstream; set PLUGIN_HTTP_PORT=8001 if 6738 conflicts)
+    if [ -n "$PLUGIN_HTTP_PORT" ]; then
+        sed -i "s/^HTTP_SERVER_PORT=.*/HTTP_SERVER_PORT=${PLUGIN_HTTP_PORT}/" dev-services.env
+        echo "  HTTP_SERVER_PORT overridden to $PLUGIN_HTTP_PORT"
+    fi
     echo "  Source cloned and compose files copied"
 fi
 
@@ -448,9 +459,44 @@ done
 
 echo ""
 
-# ── Step 11: Create update.sh ─────────────────────────────────────
+# ── Step 11: Fix database schema drift ───────────────────────────
 
-echo "Step 11: Creating ~/update.sh..."
+echo "Step 11: Fixing database schema drift..."
+echo "  Running Django migrations..."
+docker compose exec -T web python manage.py migrate --no-input 2>&1 | tail -5
+
+echo "  Applying ALTER TABLE fallback for columns migrations may miss..."
+docker compose exec -T db psql -U posthog -d posthog -c "
+  -- posthog_team
+  ALTER TABLE posthog_team
+    ADD COLUMN IF NOT EXISTS project_id bigint,
+    ADD COLUMN IF NOT EXISTS secret_api_token varchar(200),
+    ADD COLUMN IF NOT EXISTS person_processing_opt_out boolean NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS heatmaps_opt_in boolean NOT NULL DEFAULT false,
+    ADD COLUMN IF NOT EXISTS cookieless_server_hash_mode smallint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS logs_settings jsonb,
+    ADD COLUMN IF NOT EXISTS extra_settings jsonb,
+    ADD COLUMN IF NOT EXISTS drop_events_older_than interval;
+  UPDATE posthog_team SET project_id = id WHERE project_id IS NULL;
+
+  -- posthog_organization
+  ALTER TABLE posthog_organization
+    ADD COLUMN IF NOT EXISTS available_product_features jsonb NOT NULL DEFAULT '[]'::jsonb;
+
+  -- posthog_grouptypemapping
+  ALTER TABLE posthog_grouptypemapping
+    ADD COLUMN IF NOT EXISTS project_id integer;
+  UPDATE posthog_grouptypemapping SET project_id = team_id WHERE project_id IS NULL;
+" 2>/dev/null && echo "  Schema patched" || echo "  Warning: schema patch skipped (tables may not exist yet on first boot)"
+
+# Restart Node services to pick up schema changes
+docker compose restart plugins ingestion-general 2>/dev/null || true
+echo "  Node services restarted"
+echo ""
+
+# ── Step 12: Create update.sh ─────────────────────────────────────
+
+echo "Step 12: Creating ~/update.sh..."
 
 cat > "$HOME/update.sh" << 'EOF'
 #!/bin/bash
@@ -465,9 +511,9 @@ chmod +x "$HOME/update.sh"
 echo "  ~/update.sh created"
 echo ""
 
-# ── Step 12: Enable auto-start on boot ──────────────────────────────
+# ── Step 13: Enable auto-start on boot ──────────────────────────────
 
-echo "Step 12: Enabling auto-start on boot..."
+echo "Step 13: Enabling auto-start on boot..."
 
 SERVICE_FILE="/etc/systemd/system/posthog.service"
 if [ -f "$SERVICE_FILE" ]; then
