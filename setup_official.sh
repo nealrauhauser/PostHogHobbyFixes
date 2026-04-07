@@ -238,6 +238,32 @@ services:
     entrypoint: ["echo", "temporal-django-worker disabled — binary removed from image"]
 YAMLEOF
 
+# Auto-detect tunnel network from cloudflared container if not set
+if [ -z "$TUNNEL_NETWORK" ]; then
+    CF_CONTAINER=$(docker ps -qf "name=cloudflare" 2>/dev/null | head -1)
+    if [ -n "$CF_CONTAINER" ]; then
+        TUNNEL_NETWORK=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' "$CF_CONTAINER" 2>/dev/null \
+            | grep -v "^$" | head -1)
+    fi
+fi
+
+# Bridge proxy into the tunnel network so cloudflared can reach it
+if [ -n "$TUNNEL_NETWORK" ]; then
+    cat >> docker-compose.override.yml <<NETEOF
+
+  proxy:
+    networks:
+      - default
+      - tunnel-net
+
+networks:
+  tunnel-net:
+    external: true
+    name: ${TUNNEL_NETWORK}
+NETEOF
+    echo "  Proxy bridged into tunnel network: $TUNNEL_NETWORK"
+fi
+
 echo "  docker-compose.override.yml created"
 
 # ── Restart with fixes applied ────────────────────────────────────────

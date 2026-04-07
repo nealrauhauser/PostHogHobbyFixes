@@ -9,6 +9,11 @@
 # Auto-detects BIND_ADDR from hostname. Override with:
 #   BIND_ADDR=<ip> ./setup.sh
 #
+# Optional env vars:
+#   BIND_ADDR      — IP to bind ports to (default: 127.0.0.1)
+#   TUNNEL_NETWORK — Docker network to bridge into the proxy container
+#                    (auto-detected from cloudflared if running)
+#
 # Usage:
 #   ./setup.sh
 #   BIND_ADDR=10.0.0.5 ./setup.sh
@@ -380,19 +385,33 @@ services:
   # Temporal handles async exports/batch ops — not needed for core analytics.
   temporal-django-worker:
     entrypoint: ["echo", "temporal-django-worker disabled — binary removed from image"]
-
-  # If you need PostHog reachable from another Docker Compose stack,
-  # bridge the proxy into that network. Example:
-  # proxy:
-  #   networks:
-  #     - default
-  #     - your-app-network
-  #
-  # networks:
-  #   your-app-network:
-  #     external: true
-  #     name: your_network_name
 YAMLEOF
+
+# Auto-detect tunnel network from cloudflared container if not set
+if [ -z "$TUNNEL_NETWORK" ]; then
+    CF_CONTAINER=$(docker ps -qf "name=cloudflare" 2>/dev/null | head -1)
+    if [ -n "$CF_CONTAINER" ]; then
+        TUNNEL_NETWORK=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' "$CF_CONTAINER" 2>/dev/null \
+            | grep -v "^$" | head -1)
+    fi
+fi
+
+# Bridge proxy into the tunnel network so cloudflared can reach it
+if [ -n "$TUNNEL_NETWORK" ]; then
+    cat >> docker-compose.override.yml <<NETEOF
+
+  proxy:
+    networks:
+      - default
+      - tunnel-net
+
+networks:
+  tunnel-net:
+    external: true
+    name: ${TUNNEL_NETWORK}
+NETEOF
+    echo "  Proxy bridged into tunnel network: $TUNNEL_NETWORK"
+fi
 
 echo "  docker-compose.override.yml created"
 echo ""
