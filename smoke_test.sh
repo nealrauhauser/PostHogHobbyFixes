@@ -6,7 +6,7 @@
 # Each section is independent — failures don't block later tests.
 #
 # Usage:
-#   cd ~/posthog && /home/repoman/HBbackend/PostHog/smoke_test.sh
+#   cd ~/posthog && ./smoke_test.sh
 #
 # Exit code: number of failed tests (0 = all passed)
 
@@ -46,12 +46,32 @@ echo ""
 echo "1. Container Health"
 echo "───────────────────"
 
+TOTAL_CONTAINERS=$(docker compose ps -a --format "{{.Name}}" 2>/dev/null | grep -c . || true)
+if [ "${TOTAL_CONTAINERS:-0}" -lt 5 ]; then
+    fail "Only $TOTAL_CONTAINERS containers found — PostHog is not installed"
+    HAS_CONTAINER_DOWN=true
+    echo ""
+    echo "══════════════════════════════════════════"
+    echo "Results: $PASS passed, $FAIL failed, $WARN warnings"
+    echo "══════════════════════════════════════════"
+    echo ""
+    echo "┌─ Remediation ────────────────────────────┐"
+    echo "│"
+    echo "│ POSTHOG NOT INSTALLED"
+    echo "│ Run the setup script first:"
+    echo "│"
+    echo "│   ./setup.sh"
+    echo "│"
+    echo "└─────────────────────────────────────────┘"
+    exit 1
+fi
+
 UNHEALTHY=$(docker compose ps -a --format "{{.Name}} {{.Status}}" 2>/dev/null \
     | grep -v "Up \|Exited (0)" \
     | grep -v "^$" || true)
 
 if [ -z "$UNHEALTHY" ]; then
-    pass "All containers healthy"
+    pass "All containers healthy ($TOTAL_CONTAINERS containers)"
 else
     HAS_CONTAINER_DOWN=true
     UNHEALTHY_COUNT=0
@@ -117,6 +137,14 @@ if $DB_CMD -c "SELECT column_name FROM information_schema.columns WHERE table_na
     pass "posthog_grouptypemapping.project_id exists"
 else
     fail "posthog_grouptypemapping.project_id MISSING (Issue 11)"
+    HAS_SCHEMA_DRIFT=true
+fi
+
+# posthog_eventschema — required by ingestion-general (Issue 13)
+if $DB_CMD -c "SELECT 1 FROM information_schema.tables WHERE table_name='posthog_eventschema'" 2>/dev/null | grep -q "1"; then
+    pass "posthog_eventschema table exists"
+else
+    fail "posthog_eventschema table MISSING (ingestion will crash-loop)"
     HAS_SCHEMA_DRIFT=true
 fi
 
@@ -434,17 +462,23 @@ echo ""
 echo "11. Version Drift Detection"
 echo "───────────────────────────"
 
-# New 127.0.0.1 defaults we haven't overridden
-NEW_LOCALHOST=$(docker compose exec -T plugins sh -c "grep -rn '127\.0\.0\.1' /code/nodejs/dist --include='config.js' 2>/dev/null" 2>/dev/null \
+# New 127.0.0.1/localhost defaults we haven't overridden
+# Catches any env var with a localhost default — REDIS_HOST, S3_ENDPOINT, etc.
+NEW_LOCALHOST=$(docker compose exec -T plugins sh -c "grep -rn '127\.0\.0\.1\|localhost' /code/nodejs/dist --include='config.js' 2>/dev/null" 2>/dev/null \
     | grep -v "test\|node_modules" \
-    | grep -oP '\w+_REDIS_HOST' \
+    | grep -oP '[A-Z][A-Z0-9_]+(?=[\x27\x22\x60]?\s*[,:\)])' \
     | sort -u || true)
+
+# Vars for services we don't run in hobby deploy — warn, don't fail
+OPTIONAL_VARS="CDP_EMAIL_TRACKING_URL ERROR_TRACKING_CYMBAL_BASE_URL OTEL_EXPORTER_OTLP_ENDPOINT SES_ENDPOINT"
 
 for var in $NEW_LOCALHOST; do
     if grep -q "^${var}=" dev-services.env 2>/dev/null; then
         pass "$var is overridden"
+    elif echo " $OPTIONAL_VARS " | grep -q " $var "; then
+        warn "$var defaults to localhost (optional service, not critical)"
     else
-        fail "$var defaults to 127.0.0.1 but is NOT in dev-services.env"
+        fail "$var defaults to localhost but is NOT in dev-services.env"
         HAS_MISSING_CONFIG=true
     fi
 done
@@ -543,8 +577,8 @@ if [ $FAIL -gt 0 ]; then
         echo "│ Required env vars are not set. Compare against"
         echo "│ the setup script to find what's missing:"
         echo "│"
-        echo "│   diff <(grep -oP '^\w+(?==)' dev-services.env | sort) \\"
-        echo "│        <(grep -oP '^\w+(?==)' /home/repoman/HBbackend/PostHog/setup.sh | sort)"
+        echo "│ Re-run setup.sh to regenerate dev-services.env,"
+        echo "│ or compare manually against the setup script."
     fi
 
     echo "│"

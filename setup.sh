@@ -1,7 +1,7 @@
 #!/bin/bash
 # setup.sh — One-command PostHog self-hosted hobby deployment
 #
-# Fixes 12 known issues with the upstream hobby compose that prevent
+# Fixes 16 known issues with the upstream hobby compose that prevent
 # PostHog from functioning out of the box. See ISSUES.md for details.
 #
 # Repo: https://github.com/nealrauhauser/PostHogHobbyFixes
@@ -88,6 +88,17 @@ KAFKA_HOSTS=kafka:9092
 OBJECT_STORAGE_ENDPOINT=http://objectstorage:19000
 OBJECT_STORAGE_ACCESS_KEY_ID=object_storage_root_user
 OBJECT_STORAGE_SECRET_ACCESS_KEY=object_storage_root_password
+SESSION_RECORDING_V2_S3_ENDPOINT=http://objectstorage:19000
+SESSION_RECORDING_V2_S3_BUCKET=posthog
+SESSION_RECORDING_V2_S3_PREFIX=session_recordings
+SESSION_RECORDING_V2_S3_REGION=us-east-1
+SESSION_RECORDING_V2_S3_ACCESS_KEY_ID=object_storage_root_user
+SESSION_RECORDING_V2_S3_SECRET_ACCESS_KEY=object_storage_root_password
+POSTHOG_POSTGRES_HOST=db
+POSTGRES_BEHAVIORAL_COHORTS_HOST=db
+TEMPORAL_HOST=temporal
+SITE_URL=http://localhost:8000
+POSTHOG_HOST_URL=http://web:8000
 IS_BEHIND_PROXY=true
 DISABLE_SECURE_SSL_REDIRECT=true
 DEVENV
@@ -468,38 +479,53 @@ done
 
 echo ""
 
-# ── Step 11: Fix database schema drift ───────────────────────────
+# ── Step 11: Run migrations and fix schema drift ────────────────
+#
+# The web entrypoint runs ./bin/migrate on boot, but it races with
+# other containers and failures are silent. Run migrations explicitly
+# after the health check passes, then apply schema_drift.sql for
+# tables/columns the Node image expects but Django hasn't created
+# (Issues 11-15). Finally wait for graphile_worker schema before
+# restarting worker.
 
-echo "Step 11: Fixing database schema drift..."
-echo "  Running Django migrations..."
+echo "Step 11: Running Django migrations..."
 docker compose exec -T web python manage.py migrate --no-input 2>&1 | tail -5
+echo "  Migrations applied"
 
-echo "  Applying ALTER TABLE fallback for columns migrations may miss..."
-docker compose exec -T db psql -U posthog -d posthog -c "
-  -- posthog_team
-  ALTER TABLE posthog_team
-    ADD COLUMN IF NOT EXISTS project_id bigint,
-    ADD COLUMN IF NOT EXISTS secret_api_token varchar(200),
-    ADD COLUMN IF NOT EXISTS person_processing_opt_out boolean NOT NULL DEFAULT false,
-    ADD COLUMN IF NOT EXISTS heatmaps_opt_in boolean NOT NULL DEFAULT false,
-    ADD COLUMN IF NOT EXISTS cookieless_server_hash_mode smallint NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS logs_settings jsonb,
-    ADD COLUMN IF NOT EXISTS extra_settings jsonb,
-    ADD COLUMN IF NOT EXISTS drop_events_older_than interval;
-  UPDATE posthog_team SET project_id = id WHERE project_id IS NULL;
+echo "  Applying schema drift fixes (Issues 11-15)..."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCHEMA_SQL="${SCRIPT_DIR}/patches/schema_drift.sql"
+if [ ! -f "$SCHEMA_SQL" ]; then
+    SCHEMA_SQL="patches/schema_drift.sql"
+fi
 
-  -- posthog_organization
-  ALTER TABLE posthog_organization
-    ADD COLUMN IF NOT EXISTS available_product_features jsonb NOT NULL DEFAULT '[]'::jsonb;
+if [ -f "$SCHEMA_SQL" ]; then
+    docker compose exec -T db psql -U posthog -d posthog -f /dev/stdin < "$SCHEMA_SQL" 2>&1 | grep -v "^$"
+    echo "  Schema drift fixes applied"
+else
+    echo "  Warning: patches/schema_drift.sql not found — skipping"
+fi
 
-  -- posthog_grouptypemapping
-  ALTER TABLE posthog_grouptypemapping
-    ADD COLUMN IF NOT EXISTS project_id integer;
-  UPDATE posthog_grouptypemapping SET project_id = team_id WHERE project_id IS NULL;
-" 2>/dev/null && echo "  Schema patched" || echo "  Warning: schema patch skipped (tables may not exist yet on first boot)"
-
-# Restart Node services to pick up schema changes
-docker compose restart plugins ingestion-general 2>/dev/null || true
+echo "  Restarting plugins to pick up new columns..."
+docker compose restart plugins
+echo "  Waiting for plugin server to create graphile_worker schema..."
+GW_RETRIES=0
+GW_MAX=12
+while [ $GW_RETRIES -lt $GW_MAX ]; do
+    GW_EXISTS=$(docker compose exec -T db psql -U posthog -d posthog -tA \
+        -c "SELECT 1 FROM information_schema.schemata WHERE schema_name = 'graphile_worker'" 2>/dev/null)
+    if [ "$GW_EXISTS" = "1" ]; then
+        echo "  graphile_worker schema exists"
+        break
+    fi
+    GW_RETRIES=$((GW_RETRIES + 1))
+    if [ $GW_RETRIES -eq $GW_MAX ]; then
+        echo "  Warning: graphile_worker schema not found after 60s"
+        echo "  Try: docker compose logs --tail=30 plugins"
+    fi
+    sleep 5
+done
+docker compose restart worker ingestion-general
 echo "  Node services restarted"
 echo ""
 
@@ -513,7 +539,16 @@ set -e
 cd ~/posthog
 docker compose pull
 docker compose up -d
-echo "PostHog updated and restarted"
+echo "Waiting for web to be healthy..."
+sleep 15
+docker compose exec -T web python manage.py migrate --no-input 2>&1 | tail -3
+# Run schema drift fixes (single source of truth)
+SCHEMA_SQL="patches/schema_drift.sql"
+if [ -f "$SCHEMA_SQL" ]; then
+    docker compose exec -T db psql -U posthog -d posthog -f /dev/stdin < "$SCHEMA_SQL" 2>/dev/null
+fi
+docker compose restart plugins ingestion-general worker
+echo "PostHog updated, migrated, and restarted"
 EOF
 chmod +x "$HOME/update.sh"
 
