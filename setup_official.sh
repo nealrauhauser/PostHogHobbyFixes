@@ -19,10 +19,6 @@
 # Or non-interactive (skips the official script's prompts):
 #   POSTHOG_APP_TAG=latest DOMAIN=posthog.example.com ./setup_official.sh
 #
-# Optional env vars:
-#   PLUGIN_HTTP_PORT — Plugin server health port (default: 6738, upstream default)
-#                      Set to 8001 if 6738 conflicts with your stack
-#
 # Prerequisites:
 #   - Ubuntu/Debian system
 #   - 8+ GB RAM
@@ -141,13 +137,12 @@ for var in "LOGS_REDIS_TLS=false" "TRACES_REDIS_TLS=false"; do
     fi
 done
 
-# Add health port override (Issue 10)
-# Default 6738 matches current upstream; set PLUGIN_HTTP_PORT=8001 if 6738 conflicts
-PLUGIN_PORT="${PLUGIN_HTTP_PORT:-6738}"
+# Set health port to 6738 (Issue 10) — must match Caddy's reverse_proxy target
+# in the proxy container's Caddyfile (plugins:6738 for webhooks)
 if ! grep -q "^HTTP_SERVER_PORT=" dev-services.env 2>/dev/null; then
-    echo "HTTP_SERVER_PORT=${PLUGIN_PORT}" >> dev-services.env
+    echo "HTTP_SERVER_PORT=6738" >> dev-services.env
 else
-    sed -i "s/^HTTP_SERVER_PORT=.*/HTTP_SERVER_PORT=${PLUGIN_PORT}/" dev-services.env
+    sed -i "s/^HTTP_SERVER_PORT=.*/HTTP_SERVER_PORT=6738/" dev-services.env
 fi
 
 echo "  dev-services.env updated"

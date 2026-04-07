@@ -9,13 +9,9 @@
 # Auto-detects BIND_ADDR from hostname. Override with:
 #   BIND_ADDR=<ip> ./setup.sh
 #
-# Optional env vars:
-#   BIND_ADDR        — IP to bind ports to (default: 127.0.0.1)
-#   PLUGIN_HTTP_PORT — Plugin server health port (default: 6738, upstream default)
-#
 # Usage:
 #   ./setup.sh
-#   PLUGIN_HTTP_PORT=8001 ./setup.sh   # if 6738 conflicts with your stack
+#   BIND_ADDR=10.0.0.5 ./setup.sh
 #
 # Prerequisites:
 #   - Docker + Docker Compose
@@ -90,12 +86,6 @@ OBJECT_STORAGE_SECRET_ACCESS_KEY=object_storage_root_password
 IS_BEHIND_PROXY=true
 DISABLE_SECURE_SSL_REDIRECT=true
 DEVENV
-    # Allow overriding the plugin server health port (default 6738 matches
-    # current upstream; set PLUGIN_HTTP_PORT=8001 if 6738 conflicts)
-    if [ -n "$PLUGIN_HTTP_PORT" ]; then
-        sed -i "s/^HTTP_SERVER_PORT=.*/HTTP_SERVER_PORT=${PLUGIN_HTTP_PORT}/" dev-services.env
-        echo "  HTTP_SERVER_PORT overridden to $PLUGIN_HTTP_PORT"
-    fi
     echo "  Source cloned and compose files copied"
 fi
 
